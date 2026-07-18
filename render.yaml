@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: auto-recorder
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: "apt-get update -qq && apt-get install -y -qq ffmpeg && pip install -r requirements.txt"
+    startCommand: "python monitor.py"
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: POLL_SEC
+        value: "30"
+      - key: CHUNK_MIN
+        value: "10"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    autoDeploy: true

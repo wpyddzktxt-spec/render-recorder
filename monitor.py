@@ -18,9 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import imageio_ffmpeg
 import requests
 
 import server  # noqa: E402  (health endpoint for Render free tier)
+
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()  # static binary, no apt needed
 
 # ---- Config from env ----
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -146,7 +149,7 @@ def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
     """Record duration_s of HLS stream to /tmp/<name>_<ts>.mp4 via ffmpeg copy."""
     out = Path(f"/tmp/{name}_{int(time.time())}.mp4")
     cmd = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-loglevel", "error",
         "-reconnect", "1",
@@ -217,6 +220,7 @@ def main():
     server.start()
     LOG.info("=== Recorder starting on Render ===")
     LOG.info("Poll=%ss chunk=%dmin models=%s", POLL_SEC, CHUNK_MIN, list(MODELS))
+    LOG.info("ffmpeg: %s", FFMPEG_BIN)
 
     state = load_state()
     duration_s = CHUNK_MIN * 60

@@ -10,6 +10,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -76,39 +77,52 @@ def _extract_stripchat(data: dict) -> Optional[dict]:
 
 
 def _extract_bongacams(data: dict) -> Optional[dict]:
-    """Return {hls, viewers} if live with segments, else None."""
+    """Return {hls, viewers} if live with segments, else None.
+
+    Critical: mybro.tv caches streamUrl after a model goes offline — the CDN
+    keeps responding 200 but the playlist has zero #EXTINF segments. We
+    require ALL of: isOnline=true, onlineChangedAt within FRESH_MIN, and
+    HLS playlist actually has segments. This is the only way to distinguish
+    a live stream from a cached/offline one.
+    """
+    FRESH_MIN = 5  # onlineChangedAt must be within last 5 min
     m = data.get("model", {})
-    # mybro.tv isOnline is unreliable — check HLS segments directly
-    hls = (
-        m.get("hlsPlaylistUrl")
-        or m.get("hls_url")
-        or data.get("hlsPlaylistUrl")
-    )
-    # moonmaiden: HLS URL is dynamic. mybro.tv sometimes returns it directly,
-    # sometimes only after probing by alias. Build a candidate from bongacams CDN template.
-    if not hls and m.get("username"):
-        # Try a probe via mybro.tv
+    if not m.get("isOnline"):
+        return None
+    # Check onlineChangedAt freshness
+    oca = m.get("onlineChangedAt") or ""
+    if oca:
         try:
-            r = requests.get(
-                f"https://mybro.tv/api/v1/models/alias/{m['username']}/preview",
-                timeout=8,
-            )
-            if r.status_code == 200:
-                j = r.json()
-                hls = j.get("hlsPlaylistUrl") or j.get("model", {}).get("hlsPlaylistUrl")
+            ts = datetime.fromisoformat(oca.replace("Z", "+00:00"))
+            age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+            if age_min > FRESH_MIN:
+                LOG.debug(
+                    "bongacams: onlineChangedAt too old (%.1f min) — likely cached",
+                    age_min,
+                )
+                return None
         except Exception:
             pass
+
+    hls = m.get("streamUrl") or m.get("hlsPlaylistUrl")
     if not hls:
         return None
+
+    # Discriminate BongaCams CDN vs Stripchat CDN — only BongaCams is bcvcdn
+    if "bcvcdn.com" not in hls and "bongacams" not in hls:
+        # Some BongaCams models stream from Stripchat CDN; still valid HLS
+        LOG.debug("bongacams: non-bcvcdn URL %s — trying anyway", hls[:80])
+
     try:
         r = requests.get(hls, timeout=8)
         if r.status_code != 200:
             return None
         if "#EXTINF" not in r.text:
+            LOG.debug("bongacams: HLS empty (no #EXTINF) — %s", hls[:80])
             return None
         segs = r.text.count("#EXTINF")
     except Exception as e:
-        LOG.debug("HLS probe failed: %s", e)
+        LOG.debug("bongacams: HLS probe failed: %s", e)
         return None
     return {"hls": hls, "viewers": m.get("viewersCount", 0), "segs": segs}
 

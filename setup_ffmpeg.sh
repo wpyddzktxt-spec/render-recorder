@@ -1,39 +1,27 @@
 #!/usr/bin/env bash
-# Download static ffmpeg binary for Render free tier.
-# Render free tier image lacks ffmpeg, and apt-get install fails
-# (no root, restricted build). Use a pre-built static binary instead.
-set -e
+# Download a static ffmpeg build into $HOME/ffmpeg.
+# Works on Render free-tier Python runtime (no apt, no root).
+# Set FFMPEG_BIN=$HOME/ffmpeg/ffmpeg to point monitor.py at it.
+set -euo pipefail
 
-FFMPEG_DIR="/opt/ffmpeg"
-FFMPEG_BIN="$FFMPEG_DIR/ffmpeg"
+DEST="${HOME}/ffmpeg"
+mkdir -p "$DEST"
 
-if [ -x "$FFMPEG_BIN" ]; then
-    echo "ffmpeg already installed at $FFMPEG_BIN"
-    $FFMPEG_BIN -version | head -1
-    exit 0
-fi
+# johnvansickle.com hosts full static ffmpeg builds (LGPL, ~80MB).
+# We stream the tarball straight to disk; build memory stays low because
+# tar/xz decode in <50MB chunks, well under Render's 512MB build cap.
+URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+TMP="/tmp/ffmpeg-static.tar.xz"
 
-mkdir -p "$FFMPEG_DIR"
-cd /tmp
+echo "[setup_ffmpeg] downloading $URL"
+curl -sSL --fail -o "$TMP" "$URL"
 
-# Use the BtbN build (smaller, ~30MB) - GPL licensed, has all common codecs
-echo "Downloading static ffmpeg binary..."
-curl -sSL --max-time 90 \
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
-    -o ffmpeg.tar.xz
+echo "[setup_ffmpeg] extracting"
+tar -xJf "$TMP" -C /tmp/
+SRC_DIR=$(ls -d /tmp/ffmpeg-*-amd64-static | head -1)
+cp "$SRC_DIR/ffmpeg"  "$DEST/ffmpeg"
+cp "$SRC_DIR/ffprobe" "$DEST/ffprobe"
+chmod +x "$DEST/ffmpeg" "$DEST/ffprobe"
+rm -rf "$SRC_DIR" "$TMP"
 
-echo "Extracting..."
-tar xJf ffmpeg.tar.xz
-# Find the binary - directory name varies by version
-FFMPEG_PATH=$(find . -name "ffmpeg" -type f -executable | head -1)
-if [ -z "$FFMPEG_PATH" ]; then
-    echo "ERROR: ffmpeg binary not found in archive"
-    exit 1
-fi
-
-mv "$FFMPEG_PATH" "$FFMPEG_BIN"
-chmod +x "$FFMPEG_BIN"
-rm -rf ffmpeg.tar.xz ffmpeg-*
-
-echo "ffmpeg installed:"
-$FFMPEG_BIN -version | head -1
+echo "[setup_ffmpeg] done. ffmpeg: $($DEST/ffmpeg -version 2>&1 | head -1)"

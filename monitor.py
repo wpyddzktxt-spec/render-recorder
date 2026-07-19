@@ -18,12 +18,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import imageio_ffmpeg
 import requests
+import shutil
 
 import server  # noqa: E402  (health endpoint for Render free tier)
 
-FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()  # static binary, no apt needed
+# Resolve ffmpeg in order: FFMPEG_BIN env -> $HOME/ffmpeg -> /opt/ffmpeg -> /usr/bin/ffmpeg -> shutil.which
+_candidates = [
+    os.environ.get("FFMPEG_BIN"),
+    os.path.join(os.environ.get("HOME", ""), "ffmpeg", "ffmpeg"),
+    "/opt/ffmpeg/ffmpeg",
+    "/usr/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+]
+for _c in _candidates:
+    if _c and Path(_c).exists() and os.access(_c, os.X_OK):
+        FFMPEG_BIN = _c
+        break
+else:
+    _which = shutil.which("ffmpeg")
+    if _which:
+        FFMPEG_BIN = _which
+    else:
+        FFMPEG_BIN = None  # resolved later in main(); main() will sys.exit(1) if missing
 
 # ---- Config from env ----
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -220,6 +237,9 @@ def main():
     server.start()
     LOG.info("=== Recorder starting on Render ===")
     LOG.info("Poll=%ss chunk=%dmin models=%s", POLL_SEC, CHUNK_MIN, list(MODELS))
+    if not FFMPEG_BIN or not Path(FFMPEG_BIN).exists():
+        LOG.error("ffmpeg not found. Tried: %s", _candidates)
+        sys.exit(1)
     LOG.info("ffmpeg: %s", FFMPEG_BIN)
 
     state = load_state()

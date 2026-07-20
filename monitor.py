@@ -16,12 +16,19 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+from urllib.parse import urljoin
 
 import requests
 import shutil
 
 import server  # noqa: E402  (health endpoint for Render free tier)
+
+HLS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://bongacams.com/",
+    "Accept": "*/*",
+}
 
 # Resolve ffmpeg in order: FFMPEG_BIN env -> $HOME/ffmpeg -> /opt/ffmpeg -> /usr/bin/ffmpeg -> shutil.which
 _candidates = [
@@ -74,6 +81,58 @@ MODELS = {
 }
 
 
+def _probe_hls(url: str) -> Optional[Tuple[str, int]]:
+    """Fetch HLS playlist; if master (EXT-X-STREAM-INF), follow best variant.
+
+    Returns (playable_url, segment_count) or None if empty/offline stash.
+    BongaCams often gives a master playlist without #EXTINF — media is in chunks.m3u8.
+    """
+    try:
+        r = requests.get(url, timeout=10, headers=HLS_HEADERS)
+        if r.status_code != 200:
+            return None
+        text = r.text or ""
+        if "#EXTINF" in text:
+            return url, text.count("#EXTINF")
+        # Master playlist — pick last (usually highest) stream variant
+        if "#EXT-X-STREAM-INF" in text:
+            variants = []
+            lines = text.splitlines()
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                if line.startswith("#EXT-X-STREAM-INF"):
+                    bw = 0
+                    if "BANDWIDTH=" in line:
+                        try:
+                            bw = int(line.split("BANDWIDTH=")[1].split(",")[0])
+                        except Exception:
+                            bw = 0
+                    j = i + 1
+                    while j < len(lines) and (not lines[j].strip() or lines[j].strip().startswith("#")):
+                        j += 1
+                    if j < len(lines):
+                        variants.append((bw, urljoin(url, lines[j].strip())))
+                        i = j
+                i += 1
+            if not variants:
+                return None
+            variants.sort(key=lambda x: x[0])
+            media_url = variants[-1][1]
+            r2 = requests.get(media_url, timeout=10, headers=HLS_HEADERS)
+            if r2.status_code != 200:
+                return None
+            t2 = r2.text or ""
+            if "#EXTINF" not in t2:
+                return None
+            # Feed master URL to ffmpeg (it picks variants); segs from media
+            return url, t2.count("#EXTINF")
+        return None
+    except Exception as e:
+        LOG.debug("HLS probe failed: %s", e)
+        return None
+
+
 def _extract_stripchat(data: dict) -> Optional[dict]:
     """Return {hls, viewers} if live with segments, else None."""
     if data.get("count", 0) == 0:
@@ -82,69 +141,40 @@ def _extract_stripchat(data: dict) -> Optional[dict]:
     hls = m.get("stream", {}).get("url") if isinstance(m.get("stream"), dict) else None
     if not hls:
         return None
-    # Verify HLS playlist has actual segments
-    try:
-        r = requests.get(hls, timeout=8)
-        if r.status_code != 200:
-            return None
-        if "#EXTINF" not in r.text:
-            return None
-        segs = r.text.count("#EXTINF")
-    except Exception as e:
-        LOG.debug("HLS probe failed: %s", e)
+    probed = _probe_hls(hls)
+    if not probed:
         return None
-    return {"hls": hls, "viewers": m.get("viewersCount", 0), "segs": segs}
+    play_url, segs = probed
+    return {"hls": play_url, "viewers": m.get("viewersCount", 0), "segs": segs}
 
 
 def _extract_bongacams(data: dict) -> Optional[dict]:
     """Return {hls, viewers} if live with segments, else None.
 
-    Critical: mybro.tv caches streamUrl after a model goes offline — the CDN
-    keeps responding 200 but the playlist has zero #EXTINF segments. We
-    require ALL of: isOnline=true, onlineChangedAt within FRESH_MIN, and
-    HLS playlist actually has segments. This is the only way to distinguish
-    a live stream from a cached/offline one.
+    mybro.tv may keep isOnline=true briefly after offline, and streamUrl often
+    points to a *master* playlist (EXT-X-STREAM-INF) without #EXTINF. We:
+      1) require isOnline=true
+      2) resolve master → media and require real #EXTINF segments
+    onlineChangedAt is go-live timestamp (not a heartbeat) — do NOT use as
+    a short freshness window or multi-hour streams get rejected.
     """
-    FRESH_MIN = 5  # onlineChangedAt must be within last 5 min
     m = data.get("model", {})
     if not m.get("isOnline"):
         return None
-    # Check onlineChangedAt freshness
-    oca = m.get("onlineChangedAt") or ""
-    if oca:
-        try:
-            ts = datetime.fromisoformat(oca.replace("Z", "+00:00"))
-            age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
-            if age_min > FRESH_MIN:
-                LOG.debug(
-                    "bongacams: onlineChangedAt too old (%.1f min) — likely cached",
-                    age_min,
-                )
-                return None
-        except Exception:
-            pass
 
     hls = m.get("streamUrl") or m.get("hlsPlaylistUrl")
     if not hls:
         return None
 
-    # Discriminate BongaCams CDN vs Stripchat CDN — only BongaCams is bcvcdn
     if "bcvcdn.com" not in hls and "bongacams" not in hls:
-        # Some BongaCams models stream from Stripchat CDN; still valid HLS
         LOG.debug("bongacams: non-bcvcdn URL %s — trying anyway", hls[:80])
 
-    try:
-        r = requests.get(hls, timeout=8)
-        if r.status_code != 200:
-            return None
-        if "#EXTINF" not in r.text:
-            LOG.debug("bongacams: HLS empty (no #EXTINF) — %s", hls[:80])
-            return None
-        segs = r.text.count("#EXTINF")
-    except Exception as e:
-        LOG.debug("bongacams: HLS probe failed: %s", e)
+    probed = _probe_hls(hls)
+    if not probed:
+        LOG.debug("bongacams: HLS empty/unresolvable — %s", hls[:80])
         return None
-    return {"hls": hls, "viewers": m.get("viewersCount", 0), "segs": segs}
+    play_url, segs = probed
+    return {"hls": play_url, "viewers": m.get("viewersCount", 0), "segs": segs}
 
 
 def check_live(name: str) -> Optional[dict]:

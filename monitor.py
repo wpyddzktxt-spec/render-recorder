@@ -3,7 +3,7 @@
 24/7 recorder for JustKatrin (Stripchat) and moonmaiden (BongaCams) on Render.
 - Polls every 30s
 - Validates HLS playlist has #EXTINF segments (not just #EXTM3U)
-- Records 10-min chunks via ffmpeg copy
+- Records 3-min chunks via ffmpeg copy (Telegram bot video limit ~50 MB)
 - Sends to Telegram chat_id
 - Persists state across restarts (last-dispatch timestamp) to avoid duplicate work
 """
@@ -53,7 +53,7 @@ else:
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 POLL_SEC = int(os.environ.get("POLL_SEC", "30"))
-CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "10"))
+CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "3"))
 RECHECK_OK_AFTER_CHUNK = os.environ.get("RECHECK_OK_AFTER_CHUNK", "1") == "1"
 
 LOG = logging.getLogger("recorder")
@@ -219,6 +219,7 @@ def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
     if not out.exists():
         return None
     size = out.stat().st_size
+    LOG.info("Recorded %s size=%.2f MB", out.name, size / 1_048_576)
     if size < 50_000:
         LOG.warning("Chunk too small: %d bytes, removing", size)
         out.unlink(missing_ok=True)
@@ -230,6 +231,7 @@ def send_telegram(path: Path, name: str, viewers: int, duration_s: int) -> bool:
     """Send recorded file as video to Telegram."""
     cap = f"🎥 {name} | {duration_s // 60} min | {viewers} viewers"
     url = f"{TG_API}/sendVideo"
+    LOG.info("Sending %s (%d bytes) to TG", path.name, path.stat().st_size)
     with path.open("rb") as f:
         r = requests.post(
             url,
@@ -304,6 +306,10 @@ def main():
                     ok = send_telegram(chunk, name, live["viewers"], duration_s)
                     if ok:
                         chunk.unlink(missing_ok=True)
+                    else:
+                        LOG.warning("Keeping %s after failed send", chunk.name)
+                else:
+                    LOG.warning("[%s] record_chunk returned None", name)
                 state[name] = {"status": "done", "ts": time.time()}
                 save_state(state)
 

@@ -3,7 +3,7 @@
 24/7 recorder for JustKatrin (Stripchat) and moonmaiden (BongaCams) on Render.
 - Polls every 30s
 - Validates HLS playlist has #EXTINF segments (not just #EXTM3U)
-- Records 3-min chunks via ffmpeg copy (Telegram bot video limit ~50 MB)
+- Records up to 10-min chunks; ffmpeg re-encodes with -fs 48M to stay under Telegram 50 MB limit
 - Sends to Telegram chat_id
 - Persists state across restarts (last-dispatch timestamp) to avoid duplicate work
 """
@@ -53,7 +53,7 @@ else:
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 POLL_SEC = int(os.environ.get("POLL_SEC", "30"))
-CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "3"))
+CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "10"))
 RECHECK_OK_AFTER_CHUNK = os.environ.get("RECHECK_OK_AFTER_CHUNK", "1") == "1"
 
 LOG = logging.getLogger("recorder")
@@ -197,7 +197,7 @@ def check_live(name: str) -> Optional[dict]:
 
 
 def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
-    """Record duration_s of HLS stream to /tmp/<name>_<ts>.mp4 via ffmpeg copy."""
+    """Record up to duration_s of HLS stream via ffmpeg re-encode with 48 MB cap."""
     out = Path(f"/tmp/{name}_{int(time.time())}.mp4")
     hdr = "\r\n".join(f"{k}: {v}" for k, v in HLS_HEADERS.items()) + "\r\n"
     cmd = [
@@ -210,12 +210,17 @@ def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
         "-reconnect_delay_max", "3",
         "-i", hls,
         "-t", str(duration_s),
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "26",
+        "-c:a", "aac",
+        "-b:a", "64k",
         "-movflags", "+faststart",
+        "-fs", "48M",
         "-f", "mp4",
         str(out),
     ]
-    LOG.info("Recording %s for %ds -> %s", name, duration_s, out.name)
+    LOG.info("Recording %s up to %ds (48 MB cap) -> %s", name, duration_s, out.name)
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=duration_s + 30)
     except subprocess.TimeoutExpired:
@@ -233,7 +238,8 @@ def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
 
 def send_telegram(path: Path, name: str, viewers: int, duration_s: int) -> bool:
     """Send recorded file as video to Telegram."""
-    cap = f"🎥 {name} | {duration_s // 60} min | {viewers} viewers"
+    size_mb = path.stat().st_size / 1_048_576
+    cap = f"🎥 {name} | {size_mb:.0f} MB | {viewers} viewers"
     url = f"{TG_API}/sendVideo"
     LOG.info("Sending %s (%d bytes) to TG", path.name, path.stat().st_size)
     with path.open("rb") as f:

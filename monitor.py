@@ -195,10 +195,12 @@ def check_live(name: str) -> Optional[dict]:
 def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
     """Record duration_s of HLS stream to /tmp/<name>_<ts>.mp4 via ffmpeg copy."""
     out = Path(f"/tmp/{name}_{int(time.time())}.mp4")
+    hdr = "\r\n".join(f"{k}: {v}" for k, v in HLS_HEADERS.items()) + "\r\n"
     cmd = [
         FFMPEG_BIN,
         "-y",
         "-loglevel", "error",
+        "-headers", hdr,
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "3",

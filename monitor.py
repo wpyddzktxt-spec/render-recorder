@@ -171,7 +171,11 @@ def _extract_bongacams(data: dict) -> Optional[dict]:
 
     probed = _probe_hls(hls)
     if not probed:
-        LOG.debug("bongacams: HLS empty/unresolvable — %s", hls[:80])
+        # isOnline often stays true while CDN has no segments yet (private/end)
+        LOG.warning(
+            "bongacams: isOnline but HLS empty/unresolvable viewers=%s url=%s",
+            m.get("viewersCount"), (hls or "")[:100],
+        )
         return None
     play_url, segs = probed
     return {"hls": play_url, "viewers": m.get("viewersCount", 0), "segs": segs}

@@ -3,7 +3,7 @@
 24/7 recorder for JustKatrin (Stripchat) and moonmaiden (BongaCams) on Render.
 - Polls every 30s
 - Validates HLS playlist has #EXTINF segments (not just #EXTM3U)
-- Records up to 10-min chunks; ffmpeg re-encodes with -fs 48M to stay under Telegram 50 MB limit
+- Records up to 8-min chunks via ffmpeg stream-copy of mid-bitrate HLS (~2 Mbps) so TG gets playable files <50 MB
 - Sends to Telegram chat_id
 - Persists state across restarts (last-dispatch timestamp) to avoid duplicate work
 """
@@ -53,7 +53,8 @@ else:
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 POLL_SEC = int(os.environ.get("POLL_SEC", "30"))
-CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "10"))
+CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "8"))
+# Prefer ~2 Mbps HLS variant so 8-min copy stays under Telegram 50 MB (high-bitrate was ~15 MB/min)
 RECHECK_OK_AFTER_CHUNK = os.environ.get("RECHECK_OK_AFTER_CHUNK", "1") == "1"
 
 LOG = logging.getLogger("recorder")
@@ -82,19 +83,20 @@ MODELS = {
 
 
 def _probe_hls(url: str) -> Optional[Tuple[str, int]]:
-    """Fetch HLS playlist; if master (EXT-X-STREAM-INF), follow best variant.
+    """Fetch HLS playlist; if master, pick mid-bitrate media URL (~2 Mbps).
 
-    Returns (playable_url, segment_count) or None if empty/offline stash.
-    BongaCams often gives a master playlist without #EXTINF — media is in chunks.m3u8.
+    Returns (playable_media_url, segment_count) or None if empty/offline.
+    Must return media playlist (with #EXTINF), not master — so ffmpeg copy
+    stays at controlled bitrate and 8-min chunks fit Telegram 50 MB.
     """
+    target_bw = int(os.environ.get("HLS_TARGET_BW", "2000000"))  # 2 Mbps
     try:
         r = requests.get(url, timeout=10, headers=HLS_HEADERS)
         if r.status_code != 200:
             return None
         text = r.text or ""
-        if "#EXTINF" in text:
+        if "#EXTINF" in text and "#EXT-X-STREAM-INF" not in text:
             return url, text.count("#EXTINF")
-        # Master playlist — pick last (usually highest) stream variant
         if "#EXT-X-STREAM-INF" in text:
             variants = []
             lines = text.splitlines()
@@ -117,16 +119,18 @@ def _probe_hls(url: str) -> Optional[Tuple[str, int]]:
                 i += 1
             if not variants:
                 return None
-            variants.sort(key=lambda x: x[0])
-            media_url = variants[-1][1]
+            # closest to target_bw (prefer lower if tie — safer size)
+            variants.sort(key=lambda x: (abs(x[0] - target_bw), x[0]))
+            media_url = variants[0][1]
+            bw_picked = variants[0][0]
             r2 = requests.get(media_url, timeout=10, headers=HLS_HEADERS)
             if r2.status_code != 200:
                 return None
             t2 = r2.text or ""
             if "#EXTINF" not in t2:
                 return None
-            # Feed master URL to ffmpeg (it picks variants); segs from media
-            return url, t2.count("#EXTINF")
+            LOG.info("HLS variant bw=%d target=%d url=%s", bw_picked, target_bw, media_url[-60:])
+            return media_url, t2.count("#EXTINF")
         return None
     except Exception as e:
         LOG.debug("HLS probe failed: %s", e)
@@ -196,41 +200,79 @@ def check_live(name: str) -> Optional[dict]:
     return fn(data)
 
 
+def _ffprobe_duration(path: Path) -> float:
+    """Return media duration seconds, or 0 if unreadable/broken."""
+    probe = FFMPEG_BIN.replace("ffmpeg", "ffprobe") if FFMPEG_BIN else "ffprobe"
+    if not Path(probe).exists():
+        probe = shutil.which("ffprobe") or "ffprobe"
+    try:
+        p = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=20,
+        )
+        return float((p.stdout or "").strip() or 0)
+    except Exception:
+        return 0.0
+
+
 def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
-    """Record up to duration_s of HLS stream via ffmpeg re-encode with 48 MB cap."""
+    """Record duration_s of HLS via stream-copy. SIGint finishes MP4 cleanly."""
     out = Path(f"/tmp/{name}_{int(time.time())}.mp4")
     hdr = "\r\n".join(f"{k}: {v}" for k, v in HLS_HEADERS.items()) + "\r\n"
     cmd = [
         FFMPEG_BIN,
         "-y",
-        "-loglevel", "error",
+        "-loglevel", "warning",
         "-headers", hdr,
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "3",
         "-i", hls,
         "-t", str(duration_s),
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "26",
-        "-c:a", "aac",
-        "-b:a", "64k",
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
         "-movflags", "+faststart",
-        "-fs", "48M",
         "-f", "mp4",
         str(out),
     ]
-    LOG.info("Recording %s up to %ds (48 MB cap) -> %s", name, duration_s, out.name)
+    LOG.info("Recording %s for %ds (copy) -> %s", name, duration_s, out.name)
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=duration_s + 30)
-    except subprocess.TimeoutExpired:
-        LOG.warning("ffmpeg timeout, using partial %s", out)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            _, err = proc.communicate(timeout=duration_s + 45)
+        except subprocess.TimeoutExpired:
+            # Graceful stop so moov/faststart is written (kills = broken 0:00 files)
+            LOG.warning("ffmpeg hard time, sending SIGINT to finalize %s", out.name)
+            try:
+                proc.send_signal(2)  # SIGINT
+                _, err = proc.communicate(timeout=20)
+            except Exception:
+                proc.kill()
+                _, err = proc.communicate(timeout=10)
+        if err:
+            err_s = err.decode(errors="replace")[-400:]
+            if err_s.strip():
+                LOG.info("ffmpeg stderr: %s", err_s.replace("\n", " | "))
+        if proc.returncode not in (0, None) and proc.returncode != 255:
+            # 255 often from SIGINT exit — OK if file valid
+            LOG.warning("ffmpeg exit=%s", proc.returncode)
+    except Exception as e:
+        LOG.error("ffmpeg spawn failed: %s", e)
+        return None
+
     if not out.exists():
         return None
     size = out.stat().st_size
-    LOG.info("Recorded %s size=%.2f MB", out.name, size / 1_048_576)
-    if size < 50_000:
-        LOG.warning("Chunk too small: %d bytes, removing", size)
+    dur = _ffprobe_duration(out)
+    LOG.info("Recorded %s size=%.2f MB duration=%.1fs", out.name, size / 1_048_576, dur)
+    if size < 100_000 or dur < 5.0:
+        LOG.warning("Chunk unusable size=%d dur=%.1f — drop", size, dur)
+        out.unlink(missing_ok=True)
+        return None
+    # Telegram Bot sendVideo hard limit ~50 MB
+    if size > 49_000_000:
+        LOG.warning("Chunk %.1f MB > 49 MB TG limit — drop (pick lower HLS next)", size / 1_048_576)
         out.unlink(missing_ok=True)
         return None
     return out
@@ -239,7 +281,9 @@ def record_chunk(name: str, hls: str, duration_s: int) -> Optional[Path]:
 def send_telegram(path: Path, name: str, viewers: int, duration_s: int) -> bool:
     """Send recorded file as video to Telegram."""
     size_mb = path.stat().st_size / 1_048_576
-    cap = f"🎥 {name} | {size_mb:.0f} MB | {viewers} viewers"
+    dur = _ffprobe_duration(path)
+    mins = max(1, int(round(dur / 60))) if dur >= 5 else duration_s // 60
+    cap = f"🎥 {name} | {mins} min | {size_mb:.0f} MB | {viewers} viewers"
     url = f"{TG_API}/sendVideo"
     LOG.info("Sending %s (%d bytes) to TG", path.name, path.stat().st_size)
     with path.open("rb") as f:

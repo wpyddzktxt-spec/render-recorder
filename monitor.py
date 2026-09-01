@@ -519,6 +519,8 @@ def process_live(name: str, live: dict, duration_s: int, state: dict) -> None:
         for i, part in enumerate(parts):
             ok = send_telegram(part, name, live.get("viewers", 0))
             if ok:
+                from datetime import datetime as _dt
+                server.STATUS["last_chunk"] = f"{name} {_dt.now(timezone.utc).strftime('%H:%M:%S')} UTC ({part.stat().st_size // 1_048_576} MB)"
                 part.unlink(missing_ok=True)
             else:
                 LOG.warning("Keeping %s after failed send", part.name)
@@ -609,6 +611,11 @@ def main():
                 save_state(state)
 
             save_state(state)
+            # expose statuses to TG /status command
+            try:
+                server.STATUS["models"] = {k: dict(v) for k, v in state.items() if isinstance(v, dict)}
+            except Exception:
+                pass
         except Exception as e:
             LOG.exception("loop error: %s", e)
 

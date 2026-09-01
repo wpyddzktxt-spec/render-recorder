@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-24/7 recorder for JustKatrin (Stripchat) and moonmaiden (BongaCams) on Render.
+24/7 recorder for JustKatrin (Stripchat), KatrinBloom (mybro/Stripchat wl)
+and moonmaiden (BongaCams) on Render.
 - Polls every 30s
 - Validates HLS has real #EXTINF segments
 - Stream-copy mid/low bitrate HLS so 8-min chunks stay under Telegram 50 MB
@@ -44,6 +45,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 POLL_SEC = int(os.environ.get("POLL_SEC", "30"))
 CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "8"))
+# Stripchat CDN rotates playlist hosts mid-stream → long single ffmpeg runs
+# die with 404/403 after 1-3 min. Use short chunks + fresh master per chunk.
+SC_CHUNK_MIN = int(os.environ.get("SC_CHUNK_MIN", "3"))
 # Stay under bot API ~50 MB. 8 min @ ~800 kbps ≈ 48 MB.
 HLS_TARGET_BW = int(os.environ.get("HLS_TARGET_BW", "900000"))
 TG_MAX_BYTES = int(os.environ.get("TG_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -70,6 +74,10 @@ HEADERS_SC = {
     "Origin": "https://stripchat.com",
     "Accept": "*/*",
 }
+HEADERS_PLAIN = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*,*/*;q=0.8",
+}
 
 MODELS = {
     "JustKatrin": {
@@ -77,6 +85,12 @@ MODELS = {
         "check_url": "https://go.xxxiijmp.com/api/models?modelsList=JustKatrin&strict=1",
         "extract": "_extract_stripchat",
         "headers": HEADERS_SC,
+    },
+    "KatrinBloom": {
+        "platform": "bongacams",  # mybro white-label of stripchat (same stream id)
+        "check_url": "https://mybro.tv/api/v1/models/alias/katrinbloom",
+        "extract": "_extract_bongacams",
+        "headers": HEADERS_PLAIN,
     },
     "moonmaiden": {
         "platform": "bongacams",
@@ -163,6 +177,12 @@ def _probe_hls(url: str, headers: dict) -> Optional[Tuple[str, int, int]]:
         return None
 
 
+def _stream_key(url: str) -> str:
+    """Extract numeric stream id from HLS URL for cross-model dedupe."""
+    mm = re.search(r"/(\d{6,})/", url or "")
+    return mm.group(1) if mm else (url or "")[:120]
+
+
 def _extract_stripchat(data: dict, name: str = "JustKatrin") -> Optional[dict]:
     if data.get("count", 0) == 0:
         return None
@@ -184,6 +204,7 @@ def _extract_stripchat(data: dict, name: str = "JustKatrin") -> Optional[dict]:
         "segs": segs,
         "bw": bw,
         "headers": headers,
+        "key": _stream_key(hls),
     }
 
 
@@ -211,6 +232,7 @@ def _extract_bongacams(data: dict, name: str = "moonmaiden") -> Optional[dict]:
         "segs": segs,
         "bw": bw,
         "headers": headers,
+        "key": _stream_key(hls),
     }
 
 
@@ -513,9 +535,10 @@ def main():
     server.start()
     LOG.info("=== Recorder starting on Render ===")
     LOG.info(
-        "Poll=%ss chunk=%dmin target_bw=%d TG_max=%.0fMB models=%s",
+        "Poll=%ss chunk=%dmin sc_chunk=%dmin target_bw=%d TG_max=%.0fMB models=%s",
         POLL_SEC,
         CHUNK_MIN,
+        SC_CHUNK_MIN,
         HLS_TARGET_BW,
         TG_MAX_BYTES / 1_048_576,
         list(MODELS),
@@ -526,8 +549,10 @@ def main():
     LOG.info("ffmpeg: %s", FFMPEG_BIN)
 
     state = load_state()
-    duration_s = CHUNK_MIN * 60
     iteration = 0
+    # stream-key -> timestamp of last recorded chunk (dedupe white-label mirrors)
+    recent_keys: Dict[str, float] = {}
+    DEDUPE_SEC = int(os.environ.get("DEDUPE_SEC", "900"))  # 15 min
 
     while True:
         iteration += 1
@@ -541,13 +566,23 @@ def main():
                     state[name] = {"status": "offline", "ts": time.time()}
                     continue
 
+                # Skip white-label mirror of a stream recorded moments ago
+                key = live.get("key") or ""
+                if key and recent_keys.get(key, 0) > 0 and time.time() - recent_keys[key] < DEDUPE_SEC:
+                        LOG.info("[%s] LIVE but stream %s already recorded recently — skip", name, key)
+                        state[name] = {"status": "deduped", "ts": time.time()}
+                        continue
+
                 any_live = True
+                duration_s = (SC_CHUNK_MIN if MODELS[name]["platform"] == "stripchat" else CHUNK_MIN) * 60
                 LOG.info(
-                    "[%s] LIVE viewers=%d segs=%d bw=%s",
+                    "[%s] LIVE viewers=%d segs=%d bw=%s key=%s chunk=%ds",
                     name,
                     live["viewers"],
                     live["segs"],
                     live.get("bw"),
+                    key,
+                    duration_s,
                 )
 
                 # Continuous series while still live: record back-to-back
@@ -555,14 +590,18 @@ def main():
                 wave_start = time.time()
                 while time.time() - wave_start < 90 * 60:
                     process_live(name, live, duration_s, state)
-                    # Refresh immediately — no POLL_SEC wait while still live
+                    if key:
+                        recent_keys[key] = time.time()
+                    # Refresh immediately — no POLL_SEC wait while still live.
+                    # check_live re-resolves the master URL (CDN rotates hosts)
                     live = check_live(name)
                     if not live:
                         LOG.info("[%s] no longer public-live after chunk", name)
                         state[name] = {"status": "offline", "ts": time.time()}
                         break
+                    key = live.get("key") or key
                     LOG.info(
-                        "[%s] still LIVE viewers=%d — next chunk",
+                        "[%s] still LIVE viewers=%d — next chunk (fresh master)",
                         name,
                         live.get("viewers", 0),
                     )

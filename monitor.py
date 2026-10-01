@@ -8,6 +8,10 @@ and moonmaiden (BongaCams) on Render.
 - On accidental oversize: split/trim and still deliver (never silent-drop good video)
 - Continuous: while model still LIVE, next chunk starts immediately (no 30s gap)
 """
+import base64
+import hashlib
+import http.server
+import itertools
 import json
 import logging
 import os
@@ -53,6 +57,8 @@ SC_CHUNK_MIN = int(os.environ.get("SC_CHUNK_MIN", "3"))
 # 480p variant of the SC stream is ~1.4 Mbps; 3-min chunk ≈ 30 MB (fits TG).
 HLS_TARGET_BW = int(os.environ.get("HLS_TARGET_BW", "1500000"))
 TG_MAX_BYTES = int(os.environ.get("TG_MAX_BYTES", str(48 * 1024 * 1024)))
+# Cap continuous record per detection wave (avoids stuck loops on stale liveness)
+WAVE_MAX_MIN = int(os.environ.get("WAVE_MAX_MIN", "360"))
 
 LOG = logging.getLogger("recorder")
 logging.basicConfig(
@@ -81,6 +87,166 @@ HEADERS_PLAIN = {
     "Accept": "*/*,*/*;q=0.8",
 }
 
+PLAYLIST_PORT = int(os.environ.get("PLAYLIST_PORT", "8765"))
+
+# Known pkey -> pdkey pairs (community-maintained; screc / StreaMonitor)
+MOUFLON_KEYS = {
+    "Zeechoej4aleeshi": "ubahjae7goPoodi6",
+    "Zokee2OhPh9kugh4": "Quean4cai9boJa5a",
+    "Ook7quaiNgiyuhai": "EQueeGh2kaewa3ch",
+}
+
+_MOUFLON_PLACEHOLDER_RE = re.compile(r"^https?://\S+/media\.mp4\s*$")
+
+
+def _mouflon_decode(encrypted_b64: str, key: str) -> str:
+    """XOR base64 data with sha256(key) bytes -> UTF-8 string."""
+    hash_bytes = hashlib.sha256(key.encode("utf-8")).digest()
+    encrypted_data = base64.b64decode(encrypted_b64 + "==")
+    return bytes(a ^ b for (a, b) in zip(encrypted_data, itertools.cycle(hash_bytes))).decode("utf-8")
+
+
+def clean_mouflon_playlist(text: str, pdkey: str) -> Optional[str]:
+    """Decode MOUFLON v2 URIs into real segment URLs (absolute)."""
+    if "#EXT-X-MOUFLON:URI:" not in text:
+        return text
+    out = []
+    pending = None
+    for line in text.splitlines():
+        if line.startswith("#EXT-X-MOUFLON:URI:"):
+            uri = line[len("#EXT-X-MOUFLON:URI:"):].strip()
+            try:
+                encoded_part = uri.split("_")[-2]
+                decoded_part = _mouflon_decode(encoded_part[::-1], pdkey)
+                pending = uri.replace(encoded_part, decoded_part)
+            except Exception:
+                pending = None
+            continue
+        if _MOUFLON_PLACEHOLDER_RE.match(line) and pending:
+            out.append(pending)
+            pending = None
+            continue
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _known_pkey(text: str) -> Optional[str]:
+    """First PSCH:v2 token in text that we have a pdkey for."""
+    for tok in re.findall(r"#EXT-X-MOUFLON:PSCH:v2:(\S+)", text or ""):
+        if tok in MOUFLON_KEYS:
+            return tok
+    return None
+
+
+class PlaylistServer:
+    """Local HLS proxy that decodes Stripchat MOUFLON v2 segment URLs.
+
+    ffmpeg reads http://127.0.0.1:8765/playlist.m3u8; each request re-fetches
+    the media playlist with psch=v2&pkey=<known>, decodes #EXT-X-MOUFLON:URI
+    lines into real segment URLs and serves the clean playlist. Segment URLs
+    point back to the CDN directly (no proxying needed).
+    """
+
+    def __init__(self, port: int = PLAYLIST_PORT):
+        self.port = port
+        self._lock = threading.Lock()
+        self._media_url: Optional[str] = None
+        self._psch: Optional[str] = None
+        self._pkey: Optional[str] = None
+        self._pdkey: Optional[str] = None
+        self._headers: dict = {}
+        self._master_url: Optional[str] = None
+        self._cache_ts = 0.0
+        self._cache_text: Optional[str] = None
+        self._httpd: Optional[http.server.ThreadingHTTPServer] = None
+
+    def configure(self, media_url: str, psch: str, pkey: str, pdkey: str, headers: dict, master_url: Optional[str] = None) -> None:
+        with self._lock:
+            self._media_url = media_url
+            self._psch = psch
+            self._pkey = pkey
+            self._pdkey = pdkey
+            self._headers = dict(headers)
+            self._master_url = master_url
+            self._cache_ts = 0.0
+            self._cache_text = None
+
+    def start(self) -> None:
+        if self._httpd:
+            return
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), _PlaylistHandler)
+        httpd.source = self  # type: ignore
+        self._httpd = httpd
+        threading.Thread(target=httpd.serve_forever, daemon=True, name="playlist-server").start()
+        LOG.info("PlaylistServer on 127.0.0.1:%d", self.port)
+
+    def get_clean_playlist(self) -> Optional[str]:
+        with self._lock:
+            if self._cache_text and time.time() - self._cache_ts < 2.0:
+                return self._cache_text
+            text = self._fetch_locked()
+            if text:
+                self._cache_text = text
+                self._cache_ts = time.time()
+            return text
+
+    def _fetch_locked(self) -> Optional[str]:
+        if not self._media_url:
+            return None
+        url = self._media_url
+        if self._psch and self._pkey:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}psch={self._psch}&pkey={self._pkey}"
+        try:
+            r = requests.get(url, timeout=12, headers=self._headers)
+        except Exception as e:
+            LOG.debug("playlist fetch err: %s", e)
+            return None
+        if r.status_code == 200:
+            return clean_mouflon_playlist(r.text, self._pdkey)
+        if r.status_code == 403 and self._master_url:
+            # Stream may have rotated keys; re-fetch master for fresh tokens
+            try:
+                rm = requests.get(self._master_url, timeout=12, headers=self._headers)
+                pk = _known_pkey(rm.text)
+                if pk:
+                    self._pkey = pk
+                    self._pdkey = MOUFLON_KEYS[pk]
+                    sep = "&" if "?" in self._media_url else "?"
+                    url2 = f"{self._media_url}{sep}psch=v2&pkey={self._pkey}"
+                    r2 = requests.get(url2, timeout=12, headers=self._headers)
+                    if r2.status_code == 200:
+                        return clean_mouflon_playlist(r2.text, self._pdkey)
+            except Exception as e:
+                LOG.debug("master refresh err: %s", e)
+        LOG.debug("playlist fetch status %s", r.status_code)
+        return None
+
+
+class _PlaylistHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "RecorderPlaylist/1.0"
+
+    def do_GET(self):
+        if self.path.split("?")[0] != "/playlist.m3u8":
+            self.send_error(404)
+            return
+        text = self.server.source.get_clean_playlist()  # type: ignore
+        if text is None:
+            self.send_error(404)
+            return
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+playlist_server = PlaylistServer()
+
 MODELS = {
     "JustKatrin": {
         "platform": "stripchat",
@@ -90,14 +256,14 @@ MODELS = {
     },
     "KatrinBloom": {
         "platform": "stripchat",  # mybro white-label of stripchat (same stream id 21286181)
-        "check_url": "https://mybro.tv/api/v1/models/alias/katrinbloom",
-        "extract": "_extract_bongacams",
-        "headers": HEADERS_PLAIN,
-        # mybro reports isOnline but streamUrl is empty in-stream → fallback to
-        # the stripchat whitelabel mirror which returns the actual HLS URL.
-        "fallback_url": "https://go.xxxiijmp.com/api/models?modelsList=KatrinBloom&strict=1",
-        "fallback_extract": "_extract_stripchat",
-        "fallback_headers": HEADERS_SC,
+        # Mirror API primary: returns the real HLS URL reliably.
+        "check_url": "https://go.xxxiijmp.com/api/models?modelsList=KatrinBloom&strict=1",
+        "extract": "_extract_stripchat",
+        "headers": HEADERS_SC,
+        # mybro alias API fallback (same stream id, isOnline signal)
+        "fallback_url": "https://mybro.tv/api/v1/models/alias/katrinbloom",
+        "fallback_extract": "_extract_bongacams",
+        "fallback_headers": HEADERS_PLAIN,
     },
     "moonmaiden": {
         "platform": "bongacams",
@@ -123,9 +289,13 @@ def _headers_for(name: str, url: str = "") -> dict:
 def _probe_hls(url: str, headers: dict) -> Optional[Tuple[str, int, int]]:
     """Return (playable_url, segment_count, bandwidth) or None.
 
-    Prefer media playlist closest to HLS_TARGET_BW (not max — max blows TG 50 MB).
-    For live streams media URLs often rotate/403; still prefer media so bitrate is stable.
-    If media later 403s, outer loop refreshes master via fresh check_live.
+    Adaptive probing for Stripchat MOUFLON v2:
+    1. Fetch master; pick variant closest to HLS_TARGET_BW (not max — max blows TG 50 MB).
+    2. If a known pkey is present, prefer the MOUFLON decode path via the local
+       PlaylistServer (robust against CDN key rotation).
+    3. Otherwise fall back to the plain media playlist (works while live).
+    4. NEVER return the master as playable — that was the old failure wave
+       (ffmpeg fails, check_live stays truthy, endless 90-min loop).
     """
     try:
         r = requests.get(url, timeout=12, headers=headers)
@@ -133,7 +303,13 @@ def _probe_hls(url: str, headers: dict) -> Optional[Tuple[str, int, int]]:
             return None
         text = r.text or ""
         if "#EXTINF" in text and "#EXT-X-STREAM-INF" not in text:
-            return url, text.count("#EXTINF"), 0
+            # Already a media playlist (e.g. BongaCams, or plain Stripchat media)
+            if "#EXT-X-MOUFLON:URI:" not in text:
+                return url, text.count("#EXTINF"), 0
+            pkey = _known_pkey(text)
+            if pkey:
+                return _serve_mouflon(url, pkey, headers, master_url=url, bw=0)
+            return None
         if "#EXT-X-STREAM-INF" not in text:
             return None
 
@@ -169,19 +345,40 @@ def _probe_hls(url: str, headers: dict) -> Optional[Tuple[str, int, int]]:
             picked = variants[0]
 
         bw_picked, media_url = picked
+        # MOUFLON v2 path: known pkey in master -> local decode server
+        pkey = _known_pkey(text)
+        if pkey:
+            served = _serve_mouflon(media_url, pkey, headers, master_url=url, bw=bw_picked)
+            if served:
+                return served
+        # Plain media fallback (works while live)
         r2 = requests.get(media_url, timeout=12, headers=headers)
-        if r2.status_code != 200:
-            # Fall back to master — ffmpeg may still pull a variant
-            LOG.warning("media playlist HTTP %s — using master", r2.status_code)
-            return url, 1, bw_picked
-        t2 = r2.text or ""
-        if "#EXTINF" not in t2:
-            return None
-        LOG.info("HLS variant bw=%d target=%d url=...%s", bw_picked, HLS_TARGET_BW, media_url[-70:])
-        return media_url, t2.count("#EXTINF"), bw_picked
+        if r2.status_code == 200:
+            t2 = r2.text or ""
+            if "#EXTINF" in t2:
+                LOG.info("HLS plain media bw=%d target=%d url=...%s", bw_picked, HLS_TARGET_BW, media_url[-70:])
+                return media_url, t2.count("#EXTINF"), bw_picked
+        # Never return master as playable
+        LOG.warning("media playlist unusable (mouflon+plain failed) — not falling back to master")
+        return None
     except Exception as e:
         LOG.debug("HLS probe failed: %s", e)
         return None
+
+
+def _serve_mouflon(media_url: str, pkey: str, headers: dict, master_url: Optional[str], bw: int) -> Optional[Tuple[str, int, int]]:
+    """Configure the local PlaylistServer and verify it serves a decoded playlist."""
+    pdkey = MOUFLON_KEYS[pkey]
+    playlist_server.configure(media_url, "v2", pkey, pdkey, headers, master_url=master_url)
+    local = f"http://127.0.0.1:{PLAYLIST_PORT}/playlist.m3u8"
+    try:
+        rl = requests.get(local, timeout=15, headers=HEADERS_PLAIN)
+        if rl.status_code == 200 and "#EXTINF" in (rl.text or ""):
+            LOG.info("HLS MOUFLON-v2 decoded pkey=%s bw=%d -> local proxy", pkey, bw)
+            return local, (rl.text or "").count("#EXTINF"), bw
+    except Exception as e:
+        LOG.debug("local playlist probe failed: %s", e)
+    return None
 
 
 def _stream_key(url: str) -> str:
@@ -336,6 +533,8 @@ def record_chunk(name: str, hls: str, duration_s: int, headers: dict) -> Optiona
         "5",
         "-rw_timeout",
         "15000000",
+        "-protocol_whitelist",
+        "file,http,https,tcp,tls,crypto,data",
         "-i",
         hls,
         "-t",
@@ -558,10 +757,11 @@ def process_live(name: str, live: dict, duration_s: int, state: dict) -> None:
     headers = live.get("headers") or _headers_for(name, live.get("hls", ""))
     chunk = record_chunk(name, live["hls"], duration_s, headers)
     if not chunk:
-        # Retry once with master playlist + refresh
-        master = live.get("master") or live["hls"]
-        LOG.info("[%s] retry with master playlist", name)
-        chunk = record_chunk(name, master, duration_s, headers)
+        # Retry once with a fresh check_live probe (CDN rotates hosts/keys)
+        LOG.info("[%s] chunk failed — re-probe live state", name)
+        fresh = check_live(name)
+        if fresh and fresh.get("hls"):
+            chunk = record_chunk(name, fresh["hls"], duration_s, fresh.get("headers") or headers)
 
     if chunk:
         parts = fit_for_telegram(chunk)
@@ -593,6 +793,11 @@ def main():
         LOG.error("ffmpeg not found. Tried: %s", _candidates)
         sys.exit(1)
     LOG.info("ffmpeg: %s", FFMPEG_BIN)
+
+    try:
+        playlist_server.start()
+    except Exception as e:
+        LOG.error("PlaylistServer failed to start: %s", e)
 
     state = load_state()
     iteration = 0
@@ -632,9 +837,9 @@ def main():
                 )
 
                 # Continuous series while still live: record back-to-back
-                # Cap ~90 min of continuous record per detection wave to avoid stuck loops
+                # Cap continuous record per detection wave to avoid stuck loops
                 wave_start = time.time()
-                while time.time() - wave_start < 90 * 60:
+                while time.time() - wave_start < WAVE_MAX_MIN * 60:
                     process_live(name, live, duration_s, state)
                     if key:
                         recent_keys[key] = time.time()
@@ -651,7 +856,7 @@ def main():
                         name,
                         live.get("viewers", 0),
                     )
-                    time.sleep(2)  # tiny pause for CDN URL rotation
+                    time.sleep(1)  # tiny pause for CDN URL rotation
                 save_state(state)
 
             save_state(state)

@@ -11,10 +11,12 @@ and moonmaiden (BongaCams) on Render.
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -48,8 +50,8 @@ CHUNK_MIN = int(os.environ.get("CHUNK_MIN", "8"))
 # Stripchat CDN rotates playlist hosts mid-stream → long single ffmpeg runs
 # die with 404/403 after 1-3 min. Use short chunks + fresh master per chunk.
 SC_CHUNK_MIN = int(os.environ.get("SC_CHUNK_MIN", "3"))
-# Stay under bot API ~50 MB. 8 min @ ~800 kbps ≈ 48 MB.
-HLS_TARGET_BW = int(os.environ.get("HLS_TARGET_BW", "900000"))
+# 480p variant of the SC stream is ~1.4 Mbps; 3-min chunk ≈ 30 MB (fits TG).
+HLS_TARGET_BW = int(os.environ.get("HLS_TARGET_BW", "1500000"))
 TG_MAX_BYTES = int(os.environ.get("TG_MAX_BYTES", str(48 * 1024 * 1024)))
 
 LOG = logging.getLogger("recorder")
@@ -87,7 +89,7 @@ MODELS = {
         "headers": HEADERS_SC,
     },
     "KatrinBloom": {
-        "platform": "bongacams",  # mybro white-label of stripchat (same stream id)
+        "platform": "stripchat",  # mybro white-label of stripchat (same stream id 21286181)
         "check_url": "https://mybro.tv/api/v1/models/alias/katrinbloom",
         "extract": "_extract_bongacams",
         "headers": HEADERS_PLAIN,
@@ -525,8 +527,31 @@ def save_state(state: dict):
         LOG.debug("state save: %s", e)
 
 
+# Async Telegram delivery: the next chunk starts recording immediately while
+# the previous one uploads, so the inter-chunk gap is only the live re-check.
+_send_queue: "queue.Queue[Tuple[Path, str, int]]" = queue.Queue()
+
+
+def _send_worker():
+    from datetime import datetime as _dt, timezone as _tz
+    while True:
+        try:
+            part, name, viewers = _send_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            ok = send_telegram(part, name, viewers)
+            if ok:
+                server.STATUS["last_chunk"] = f"{name} {_dt.now(_tz.utc).strftime('%H:%M:%S')} UTC ({part.stat().st_size // 1_048_576} MB)"
+                part.unlink(missing_ok=True)
+            else:
+                LOG.warning("Keeping %s after failed send", part.name)
+        except Exception as e:
+            LOG.error("send worker error for %s: %s", part.name, e)
+
+
 def process_live(name: str, live: dict, duration_s: int, state: dict) -> None:
-    """Record + send one chunk for a live model."""
+    """Record one chunk; deliver to TG asynchronously (no inter-chunk stall)."""
     state[name] = {"status": "recording", "ts": time.time()}
     save_state(state)
 
@@ -540,14 +565,8 @@ def process_live(name: str, live: dict, duration_s: int, state: dict) -> None:
 
     if chunk:
         parts = fit_for_telegram(chunk)
-        for i, part in enumerate(parts):
-            ok = send_telegram(part, name, live.get("viewers", 0))
-            if ok:
-                from datetime import datetime as _dt
-                server.STATUS["last_chunk"] = f"{name} {_dt.now(timezone.utc).strftime('%H:%M:%S')} UTC ({part.stat().st_size // 1_048_576} MB)"
-                part.unlink(missing_ok=True)
-            else:
-                LOG.warning("Keeping %s after failed send", part.name)
+        for part in parts:
+            _send_queue.put((part, name, live.get("viewers", 0)))
         if not parts:
             LOG.warning("[%s] no deliverable parts", name)
     else:
@@ -558,6 +577,7 @@ def process_live(name: str, live: dict, duration_s: int, state: dict) -> None:
 
 
 def main():
+    threading.Thread(target=_send_worker, daemon=True, name="tg-send").start()
     server.start()
     LOG.info("=== Recorder starting on Render ===")
     LOG.info(

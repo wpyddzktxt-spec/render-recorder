@@ -91,6 +91,11 @@ MODELS = {
         "check_url": "https://mybro.tv/api/v1/models/alias/katrinbloom",
         "extract": "_extract_bongacams",
         "headers": HEADERS_PLAIN,
+        # mybro reports isOnline but streamUrl is empty in-stream → fallback to
+        # the stripchat whitelabel mirror which returns the actual HLS URL.
+        "fallback_url": "https://go.xxxiijmp.com/api/models?modelsList=KatrinBloom&strict=1",
+        "fallback_extract": "_extract_stripchat",
+        "fallback_headers": HEADERS_SC,
     },
     "moonmaiden": {
         "platform": "bongacams",
@@ -183,7 +188,7 @@ def _stream_key(url: str) -> str:
     return mm.group(1) if mm else (url or "")[:120]
 
 
-def _extract_stripchat(data: dict, name: str = "JustKatrin") -> Optional[dict]:
+def _extract_stripchat(data: dict, name: str = "JustKatrin", headers: Optional[dict] = None) -> Optional[dict]:
     if data.get("count", 0) == 0:
         return None
     m = (data.get("models") or [{}])[0]
@@ -191,7 +196,8 @@ def _extract_stripchat(data: dict, name: str = "JustKatrin") -> Optional[dict]:
     hls = stream.get("url") if stream else None
     if not hls:
         return None
-    headers = _headers_for(name, hls)
+    if headers is None:
+        headers = _headers_for(name, hls)
     probed = _probe_hls(hls, headers)
     if not probed:
         LOG.warning("stripchat: listed live but HLS empty (%s)", (hls or "")[:90])
@@ -248,7 +254,25 @@ def check_live(name: str) -> Optional[dict]:
         LOG.debug("%s: check failed: %s", name, e)
         return None
     fn = globals()[cfg["extract"]]
-    return fn(data, name)
+    live = fn(data, name)
+
+    # Fallback chain: e.g. KatrinBloom on mybro is online but streamUrl is empty,
+    # so resolve the real HLS from the stripchat whitelabel mirror.
+    if not live and cfg.get("fallback_url"):
+        try:
+            r2 = requests.get(cfg["fallback_url"], timeout=12)
+            if r2.status_code == 200:
+                fdata = r2.json()
+                ffn = globals()[cfg["fallback_extract"]]
+                live = ffn(fdata, name, cfg.get("fallback_headers"))
+                if live:
+                    LOG.info(
+                        "[%s] resolved via fallback mirror viewers=%d key=%s",
+                        name, live.get("viewers", 0), live.get("key"),
+                    )
+        except Exception as e:
+            LOG.debug("%s: fallback check failed: %s", name, e)
+    return live
 
 
 def _ffprobe_bin() -> str:
